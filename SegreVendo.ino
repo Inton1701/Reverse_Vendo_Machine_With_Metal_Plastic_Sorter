@@ -28,7 +28,6 @@
 
 // Servos
 #define SERVO1_PIN 30           // Main gate
-#define SERVO2_PIN 32           // Second gate
 #define SERVO3_PIN 34           // Water dispenser guide
 
 // Controls
@@ -44,7 +43,6 @@
 //=============== COMPONENT INITIALIZATION ===============//
 HX711 scale(LOADCELL_DOUT, LOADCELL_CLK);
 Servo servo1;  // Main gate
-Servo servo2;  // Second gate
 Servo servo3;  // Water dispenser guide
 LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C LCD
 
@@ -53,7 +51,6 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C LCD
 bool bottleOnScale = false;           // Bottle detected
 bool bottleWeightProcessed = false;   // Weight validation done
 bool gate1Open = false;               // Main gate open
-bool gate2Open = false;               // Second gate open
 bool plasticDetected = false;         // Plastic material found
 bool metalDetected = false;           // Metal material found
 bool materialDetectionActive = false; // Detection in progress
@@ -64,7 +61,6 @@ int currentMenuIndex = 0;             // Selected menu item
 // Timing variables
 unsigned long bottleDetectedTime = 0;
 unsigned long gate1OpenTime = 0;
-unsigned long gate2OpenTime = 0;
 unsigned long lastWeightReading = 0;
 unsigned long lastInvalidBuzzTime = 0;
 unsigned long materialDetectionStartTime = 0;
@@ -92,8 +88,6 @@ bool lastSortedWasPlastic = false;
 // Servo positions
 const int SERVO1_CLOSED = 0;
 const int SERVO1_OPEN = 180;
-const int SERVO2_CLOSED = 0;
-const int SERVO2_OPEN = 180;
 const int SERVO3_NEUTRAL = 90;
 const int SERVO3_PLASTIC = 45;
 const int SERVO3_METAL = 135;
@@ -103,8 +97,8 @@ const unsigned long DETECTION_DELAY = 500;
 const unsigned long CONFIRMATION_DELAY = 300;
 const unsigned long BUZZ_COOLDOWN = 1000;
 const unsigned long LED_DISPLAY_TIME = 2000;
-const unsigned long SERVO_MOVE_DELAY = 1000;
-const unsigned long GATE_HOLD_TIME = 2000;
+const unsigned long SERVO_MOVE_DELAY = 200;  // Reduced from 1000 to 200
+const unsigned long GATE_HOLD_TIME = 1000;   // Reduced from 2000 to 1000
 const unsigned long ULTRASONIC_READING_INTERVAL = 500;
 const unsigned long LCD_UPDATE_INTERVAL = 1000;
 unsigned long WATER_DISPENSE_DURATION = 3000;  // Variable (calculated from flow rate)
@@ -126,8 +120,10 @@ const unsigned long MATERIAL_DETECTION_TIMEOUT = 8000;
 const unsigned long SENSOR_COOLDOWN_TIME = 2000;
 
 // Weight thresholds (configurable)
-float MIN_VALID_WEIGHT = 13.0;        // Minimum bottle weight
-float MAX_VALID_WEIGHT = 35.0;        // Maximum bottle weight
+float MIN_PLASTIC_WEIGHT = 13.0;      // Minimum plastic bottle weight
+float MAX_PLASTIC_WEIGHT = 25.0;      // Maximum plastic bottle weight
+float MIN_METAL_WEIGHT = 20.0;        // Minimum metal bottle weight
+float MAX_METAL_WEIGHT = 35.0;        // Maximum metal bottle weight
 const float BOTTLE_DETECTION_THRESHOLD = 10.0; // Scale detection threshold
 float PLASTIC_FULL_AMOUNT = 10.0;      // Plastic bin full distance
 float METAL_FULL_AMOUNT = 10.0;        // Metal bin full distance
@@ -158,20 +154,26 @@ bool joystickButtonPressed = false;
 bool joystickButtonPrevious = false;
 
 // Settings menu structure
-const int NUM_MENU_ITEMS = 12;
+const int NUM_MENU_ITEMS = 20;
 const char* menuItems[NUM_MENU_ITEMS] = {
-  "Flowrate(ml/min)",
-  "Run calibration",
-  "Water amount",
+  "Run calibration",  // Scale calibration (auto/manual)
   "Cal mode",
-  "Cal point",
-  "Min weight",
-  "Max weight",
+  "Cal point", 
+  "Run water cal",    // Water flow rate calibration
+  "Flowrate(ml/min)",
+  "Water amount",
+  "Dispense water",
+  "Min plastic wt",
+  "Max plastic wt",
+  "Min metal wt",
+  "Max metal wt",
   "Plastic full",
   "Metal full",
+  "Servo 1 test",
+  "Servo 3 test",
+  "Exit & Save",
   "Restore Default",
-  "Reset Device",
-  "Exit & Save"
+  "Reset Device"
 };
 
 // EEPROM settings structure
@@ -182,8 +184,10 @@ struct SystemSettings {
   bool useManualCalibration;
   float manualCalibrationFactor;
   float autoCalibrationFactor;
-  float minValidWeight;
-  float maxValidWeight;
+  float minPlasticWeight;
+  float maxPlasticWeight;
+  float minMetalWeight;
+  float maxMetalWeight;
   float plasticFullAmount;
   float metalFullAmount;
 };
@@ -192,7 +196,6 @@ SystemSettings settings;
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Bottle Sorter v2.5");
 
   // Initialize sensor pins
   pinMode(PLASTIC_SENSOR_PIN, INPUT);
@@ -223,14 +226,10 @@ void setup() {
 
   // Setup servos
   servo1.attach(SERVO1_PIN);
-  servo2.attach(SERVO2_PIN);
   servo3.attach(SERVO3_PIN);
   
   servo1.write(SERVO1_CLOSED);
-  servo2.write(SERVO2_CLOSED);
   servo3.write(SERVO3_NEUTRAL);
-  
-  Serial.println("System initialization complete");
 
   // Setup LCD
   lcd.init();
@@ -323,6 +322,26 @@ void loop() {
     return;
   }
 
+  // Skip all bottle processing when water is dispensing
+  if (waterDispensing) {
+    // Water button handling
+    handleWaterButton(currentTime);
+    
+    // Water dispensing timeout
+    if (currentTime - waterDispenseStartTime >= WATER_DISPENSE_DURATION) {
+      stopWaterDispense();
+    }
+    
+    // Display updates
+    if (currentTime - lastLCDUpdate >= LCD_UPDATE_INTERVAL) {
+      updateLCD();
+      lastLCDUpdate = currentTime;
+    }
+    
+    delay(10);
+    return;
+  }
+
   // Handle invalid weight warning
   if (invalidWeightDetected) {
     handleInvalidWeight(currentTime);
@@ -340,11 +359,7 @@ void loop() {
   // Sensor cooldown management
   if (sensorCooldownActive && (currentTime - sensorCooldownStart >= SENSOR_COOLDOWN_TIME)) {
     sensorCooldownActive = false;
-    Serial.println("Sensor cooldown ended");
   }
-
-  // Material detection
-  handleMaterialDetection(currentTime);
 
   // Bin level monitoring
   if (currentTime - lastUltrasonicReading >= ULTRASONIC_READING_INTERVAL) {
@@ -362,14 +377,8 @@ void loop() {
   // Water button handling
   handleWaterButton(currentTime);
 
-  // Water dispensing timeout
-  if (waterDispensing && (currentTime - waterDispenseStartTime >= WATER_DISPENSE_DURATION)) {
-    stopWaterDispense();
-  }
-
   // Material detection timeout
   if (waitingForMaterialDetection && (currentTime - materialDetectionStartTime >= MATERIAL_DETECTION_TIMEOUT)) {
-    Serial.println("Material detection timeout");
     resetSystemState();
   }
 
@@ -408,7 +417,6 @@ void checkBinFullStatus() {
   if (plasticBinDistance <= PLASTIC_FULL_AMOUNT) {
     if (!plasticBinFull) {
       plasticBinFull = true;
-      Serial.println("ALERT: Plastic bin full");
       digitalWrite(LED_PLASTIC_FULL, HIGH);
       buzzWarning();
     }
@@ -423,7 +431,6 @@ void checkBinFullStatus() {
   if (metalBinDistance <= METAL_FULL_AMOUNT) {
     if (!metalBinFull) {
       metalBinFull = true;
-      Serial.println("ALERT: Metal bin full");
       digitalWrite(LED_METAL_FULL, HIGH);
       buzzWarning();
     }
@@ -435,197 +442,128 @@ void checkBinFullStatus() {
   }
 }
 
-// Material detection with debouncing
-void handleMaterialDetection(unsigned long currentTime) {
-  // Skip during cooldown
-  if (sensorCooldownActive) {
-    return;
-  }
-
-  // Rate limiting
-  if (currentTime - lastDetectionTime < DETECTION_DELAY) {
-    return;
-  }
-
-  // Read sensors
+// Validate bottle weight and material detection
+void validateBottleWeight(unsigned long currentTime, float weight) {
+  // Read material sensors
   bool rawPlastic = digitalRead(PLASTIC_SENSOR_PIN) == HIGH;
   bool rawMetal = digitalRead(METAL_SENSOR_PIN) == LOW;
-
-  // Debounce readings
-  if (rawPlastic || rawMetal) {
-    delay(CONFIRMATION_DELAY);
-    
-    // Confirm readings
-    rawPlastic = digitalRead(PLASTIC_SENSOR_PIN) == HIGH;
-    rawMetal = digitalRead(METAL_SENSOR_PIN) == LOW;
-    
-    delay(100);
-    bool confirmPlastic = digitalRead(PLASTIC_SENSOR_PIN) == HIGH;
-    bool confirmMetal = digitalRead(METAL_SENSOR_PIN) == LOW;
-    
-    // Reject inconsistent readings
-    if (rawPlastic != confirmPlastic || rawMetal != confirmMetal) {
-      return;
-    }
-  }
-
-  // Determine material type
   bool isPlastic = rawPlastic && !rawMetal;
   bool isMetal = rawMetal;
-
-  // Handle plastic detection
+  
+  bool validWeight = false;
+  
+  // Check weight based on material type
   if (isPlastic) {
-    if (!plasticPreviouslyDetected) {
-      // Check bin capacity
-      if (plasticBinFull) {
-        Serial.println("ERROR: Plastic bin full");
-        digitalWrite(LED_ERROR, HIGH);
-        buzzWarning();
-        return;
-      }
-      
-      activatePlasticResponse(currentTime);
-      plasticPreviouslyDetected = true;
-      metalPreviouslyDetected = false;
-      lastDetectionTime = currentTime;
-      
-      plasticDetected = true;
-      waitingForMaterialDetection = false;
-      performPlasticSorting();
-      startSensorCooldown(currentTime);
-    }
+    validWeight = (weight >= MIN_PLASTIC_WEIGHT && weight <= MAX_PLASTIC_WEIGHT);
+  } else if (isMetal) {
+    validWeight = (weight >= MIN_METAL_WEIGHT && weight <= MAX_METAL_WEIGHT);
   }
-  // Handle metal detection
-  else if (isMetal) {
-    if (!metalPreviouslyDetected) {
-      // Check bin capacity
-      if (metalBinFull) {
-        Serial.println("ERROR: Metal bin full");
-        digitalWrite(LED_ERROR, HIGH);
-        buzzWarning();
-        return;
-      }
-      
-      activateMetalResponse(currentTime);
-      metalPreviouslyDetected = true;
-      plasticPreviouslyDetected = false;
-      lastDetectionTime = currentTime;
-      
-      metalDetected = true;
-      waitingForMaterialDetection = false;
-      performMetalSorting();
-      startSensorCooldown(currentTime);
+  
+  // Check if both weight and material detection are valid
+  if (validWeight && (isPlastic || isMetal)) {
+    // Check bin capacity
+    if ((isPlastic && plasticBinFull) || (isMetal && metalBinFull)) {
+      digitalWrite(LED_ERROR, HIGH);
+      invalidWeightDetected = true;
+      lastInvalidBuzzTime = currentTime;
+      buzzWarning();
+      return;
     }
+    
+    // Set material flags
+    plasticDetected = isPlastic;
+    metalDetected = isMetal;
+    
+    // Position servo3 before opening gate based on material type
+    if (isPlastic) {
+      servo3.write(SERVO3_PLASTIC);  // Guide to plastic bin
+    } else if (isMetal) {
+      servo3.write(SERVO3_METAL);    // Guide to metal bin
+    }
+    delay(SERVO_MOVE_DELAY);  // Wait for servo to reach position
+    
+    buzzTwiceFast();
+    openGate1(currentTime);
+  } else {
+    digitalWrite(LED_ERROR, HIGH);
+    invalidWeightDetected = true;
+    lastInvalidBuzzTime = currentTime;
+    buzzWarning();
   }
-  // No material detected
-  else {
-    if (ledActive && (currentTime - ledOnTime > LED_DISPLAY_TIME)) {
-      digitalWrite(LED_PLASTIC, LOW);
-      digitalWrite(LED_METAL, LOW);
-      digitalWrite(LED_ERROR, LOW);
-      ledActive = false;
-      plasticPreviouslyDetected = false;
-      metalPreviouslyDetected = false;
-      
-      resetSystemState();
+}
+
+// Check bottle weight
+void checkBottleWeight(unsigned long currentTime) {
+  float weight = scale.get_units(3);
+  if (weight < 0) weight = 0.00;
+
+  // Detect bottle placement
+  if (weight >= BOTTLE_DETECTION_THRESHOLD) {
+    if (!bottleOnScale) {
+      // New bottle detected
+      bottleOnScale = true;
+      bottleDetectedTime = currentTime;
+      bottleWeightProcessed = false;
+    }
+
+    // Validate weight after delay
+    if (!bottleWeightProcessed && (currentTime - bottleDetectedTime >= WEIGHT_VALIDATION_DELAY)) {
+      validateBottleWeight(currentTime, weight);
+      bottleWeightProcessed = true;
+    }
+  } else {
+    // Bottle removed
+    if (bottleOnScale) {
+      bottleOnScale = false;
+      bottleWeightProcessed = false;
+
+      if (gate1Open) {
+        // Bottle passed through gate - perform sorting
+        if (plasticDetected) {
+          performPlasticSorting();
+        } else if (metalDetected) {
+          performMetalSorting();
+        }
+        resetSystemState();
+      } else {
+        // Bottle removed without processing
+        resetSystemState();
+      }
     }
   }
 }
 
-//=============== SORTING FUNCTIONS ===============//
+// Manage gate timing
+void manageGates(unsigned long currentTime) {
+  // Auto-close main gate
+  if (gate1Open && (currentTime - gate1OpenTime >= GATE_OPEN_DURATION)) {
+    servo1.write(SERVO1_CLOSED);
+    gate1Open = false;
+  }
+}
+
 // Sort plastic bottle
 void performPlasticSorting() {
-  Serial.println("Sorting: Plastic");
-  
-  // Award credit
   credits++;
-  Serial.print("Credits: ");
-  Serial.println(credits);
   
-  // Move to neutral then plastic position
-  servo3.write(SERVO3_NEUTRAL);
-  delay(SERVO_MOVE_DELAY);
-  servo3.write(SERVO3_PLASTIC);
-  delay(SERVO_MOVE_DELAY);
-  
-  // Open gate
-  servo2.write(SERVO2_OPEN);
-  gate2Open = true;
-  gate2OpenTime = millis();
-  delay(GATE_HOLD_TIME);
-  
-  // Close gate and return to neutral
-  servo2.write(SERVO2_CLOSED);
-  gate2Open = false;
-  delay(SERVO_MOVE_DELAY);
-  servo3.write(SERVO3_NEUTRAL);
+  // Servo3 is already positioned, just wait then return to neutral
+  delay(SERVO_MOVE_DELAY);  // Allow bottle to pass through
+  servo3.write(SERVO3_NEUTRAL);  // Return to neutral position
   delay(SERVO_MOVE_DELAY);
 }
 
 // Sort metal bottle
 void performMetalSorting() {
-  Serial.println("Sorting: Metal");
-  
-  // Award credit
   credits++;
-  Serial.print("Credits: ");
-  Serial.println(credits);
   
-  // Move to neutral then metal position
-  servo3.write(SERVO3_NEUTRAL);
+  // Servo3 is already positioned, just wait then return to neutral
+  delay(SERVO_MOVE_DELAY);  // Allow bottle to pass through
+  servo3.write(SERVO3_NEUTRAL);  // Return to neutral position
   delay(SERVO_MOVE_DELAY);
-  servo3.write(SERVO3_METAL);
-  delay(SERVO_MOVE_DELAY);
-  
-  // Open gate
-  servo2.write(SERVO2_OPEN);
-  gate2Open = true;
-  gate2OpenTime = millis();
-  delay(GATE_HOLD_TIME);
-  
-  // Close gate and return to neutral
-  servo2.write(SERVO2_CLOSED);
-  gate2Open = false;
-  delay(SERVO_MOVE_DELAY);
-  servo3.write(SERVO3_NEUTRAL);
-  delay(SERVO_MOVE_DELAY);
-}
-
-//=============== WATER SYSTEM FUNCTIONS ===============//
-// Handle water button with debounce
-void handleWaterButton(unsigned long currentTime) {
-  static bool lastButtonState = HIGH;
-  bool currentButtonState = digitalRead(WATER_BUTTON);
-  
-  // Detect button press
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
-    if (currentTime - lastButtonPress > BUTTON_DEBOUNCE_TIME) {
-      if (!waterDispensing) {
-        // Check credits
-        if (credits >= WATER_CREDIT_COST) {
-          credits -= WATER_CREDIT_COST;
-          Serial.print("Credit used. Remaining: ");
-          Serial.println(credits);
-          startWaterDispense(currentTime);
-        } else {
-          Serial.println("No credits available");
-          buzzWarning();
-          // Flash error LED
-          digitalWrite(LED_ERROR, HIGH);
-          delay(500);
-          digitalWrite(LED_ERROR, LOW);
-        }
-      }
-      lastButtonPress = currentTime;
-    }
-  }
-  
-  lastButtonState = currentButtonState;
 }
 
 // Start water dispensing
 void startWaterDispense(unsigned long currentTime) {
-  Serial.println("Water: Start");
   waterDispensing = true;
   waterDispenseStartTime = currentTime;
   digitalWrite(RELAY_PUMP, LOW);  // Turn ON (inverted logic)
@@ -634,14 +572,12 @@ void startWaterDispense(unsigned long currentTime) {
 
 // Stop water dispensing
 void stopWaterDispense() {
-  Serial.println("Water: Stop");
   waterDispensing = false;
   digitalWrite(RELAY_PUMP, HIGH);  // Turn OFF (inverted logic)
   buzzShort();
   servo3.write(SERVO3_NEUTRAL);
 }
 
-//=============== DISPLAY FUNCTIONS ===============//
 // Update LCD display
 void updateLCD() {
   lcd.clear();
@@ -661,6 +597,24 @@ void updateLCD() {
   
   if (inSettingsMode) {
     updateSettingsDisplay();
+    return;
+  }
+  
+  // Check for bin full alerts first
+  bool rawPlastic = digitalRead(PLASTIC_SENSOR_PIN) == HIGH;
+  bool rawMetal = digitalRead(METAL_SENSOR_PIN) == LOW;
+  
+  if (plasticBinFull && rawPlastic) {
+    lcd.print("PLASTIC BIN FULL");
+    lcd.setCursor(0, 1);
+    lcd.print("EMPTY BIN!");
+    return;
+  }
+  
+  if (metalBinFull && rawMetal) {
+    lcd.print("METAL BIN FULL");
+    lcd.setCursor(0, 1);
+    lcd.print("EMPTY BIN!");
     return;
   }
   
@@ -700,11 +654,13 @@ void updateSettingsDisplay() {
   
   // Show category headers
   if (currentMenuIndex < 3) {
-    lcd.print("DISPENSE CAL");
+    lcd.print("SCALE CAL");
   } else if (currentMenuIndex < 7) {
+    lcd.print("DISPENSE CAL");
+  } else if (currentMenuIndex < 13) {
     lcd.print("WEIGHT CAL");
-  } else if (currentMenuIndex < 9) {
-    lcd.print("BIN LEVEL CAL");
+  } else if (currentMenuIndex < 15) {
+    lcd.print("SERVO TEST");
   } else {
     lcd.print("SYSTEM");
   }
@@ -712,19 +668,22 @@ void updateSettingsDisplay() {
   lcd.setCursor(0, 1);
   lcd.print("> ");
   
-  // Special handling for "Run calibration"
-  if (currentMenuIndex == 1) {
+  // Special handling for calibration displays
+  if (currentMenuIndex == 0) {
+    // Scale calibration - show mode dependent
     if (settings.useManualCalibration) {
-      lcd.print("Water Cal");
+      lcd.print("Manual Cal");
     } else {
       lcd.print("Auto Cal");
     }
+  } else if (currentMenuIndex == 3) {
+    // Water calibration - always show Water Cal
+    lcd.print("Water Cal");
   } else {
     lcd.print(menuItems[currentMenuIndex]);
   }
 }
 
-//=============== FEEDBACK FUNCTIONS ===============//
 // Plastic detection feedback
 void activatePlasticResponse(unsigned long currentTime) {
   digitalWrite(LED_PLASTIC, HIGH);
@@ -770,83 +729,10 @@ void buzzWarning() {
   }
 }
 
-//=============== SYSTEM CONTROL FUNCTIONS ===============//
 // Start sensor cooldown
 void startSensorCooldown(unsigned long currentTime) {
   sensorCooldownActive = true;
   sensorCooldownStart = currentTime;
-}
-
-// Check bottle weight
-void checkBottleWeight(unsigned long currentTime) {
-  float weight = scale.get_units(3);
-  if (weight < 0) weight = 0.00;
-
-  // Detect bottle placement
-  if (weight >= BOTTLE_DETECTION_THRESHOLD) {
-    if (!bottleOnScale) {
-      // New bottle detected
-      bottleOnScale = true;
-      bottleDetectedTime = currentTime;
-      bottleWeightProcessed = false;
-      Serial.print("Bottle: ");
-      Serial.print(weight, 1);
-      Serial.println("g");
-    }
-
-    // Validate weight after delay
-    if (!bottleWeightProcessed && (currentTime - bottleDetectedTime >= WEIGHT_VALIDATION_DELAY)) {
-      validateBottleWeight(currentTime, weight);
-      bottleWeightProcessed = true;
-    }
-  } else {
-    // Bottle removed
-    if (bottleOnScale) {
-      bottleOnScale = false;
-      bottleWeightProcessed = false;
-
-      if (gate1Open) {
-        // Bottle passed through gate
-        waitingForMaterialDetection = true;
-        materialDetectionStartTime = currentTime;
-        materialDetectionActive = true;
-      } else {
-        // Bottle removed without processing
-        resetSystemState();
-      }
-    }
-  }
-}
-
-// Validate bottle weight
-void validateBottleWeight(unsigned long currentTime, float weight) {
-  if (weight >= MIN_VALID_WEIGHT && weight <= MAX_VALID_WEIGHT) {
-    Serial.println("Weight: Valid");
-    buzzTwiceFast();
-    openGate1(currentTime);
-  } else {
-    Serial.println("Weight: Invalid");
-    digitalWrite(LED_ERROR, HIGH);
-    invalidWeightDetected = true;
-    lastInvalidBuzzTime = currentTime;
-    buzzWarning();
-  }
-}
-
-// Open main gate
-void openGate1(unsigned long currentTime) {
-  servo1.write(SERVO1_OPEN);
-  gate1Open = true;
-  gate1OpenTime = currentTime;
-}
-
-// Manage gate timing
-void manageGates(unsigned long currentTime) {
-  // Auto-close main gate
-  if (gate1Open && (currentTime - gate1OpenTime >= GATE_OPEN_DURATION)) {
-    servo1.write(SERVO1_CLOSED);
-    gate1Open = false;
-  }
 }
 
 // Reset system state
@@ -861,11 +747,6 @@ void resetSystemState() {
   if (gate1Open) {
     servo1.write(SERVO1_CLOSED);
     gate1Open = false;
-  }
-  
-  if (gate2Open) {
-    servo2.write(SERVO2_CLOSED);
-    gate2Open = false;
   }
   
   // Reset servo positions
@@ -893,7 +774,6 @@ void handleInvalidWeight(unsigned long currentTime) {
     delay(100);
     digitalWrite(BUZZER, LOW);
     lastInvalidBuzzTime = currentTime;
-    Serial.println("Invalid weight - remove bottle");
   }
 }
 
@@ -949,10 +829,6 @@ void continueCalibration(unsigned long currentTime) {
         
         // Save calibration factor
         settings.autoCalibrationFactor = calibration_factor;
-        
-        Serial.println("System ready");
-        Serial.print("Auto calibration factor: ");
-        Serial.println(calibration_factor);
         
         lcd.clear();
         lcd.setCursor(0, 0);
@@ -1030,10 +906,6 @@ void runAutoCalibration() {
           // Save calibration factor
           settings.autoCalibrationFactor = calibration_factor;
           
-          Serial.println("Auto calibration complete");
-          Serial.print("Auto calibration factor: ");
-          Serial.println(calibration_factor);
-          
           lcd.clear();
           lcd.setCursor(0, 0);
           lcd.print("Calibration");
@@ -1074,7 +946,6 @@ void enterSettingsMode() {
   inSettingsMode = true;
   currentMenuIndex = 0;
   updateSettingsDisplay();
-  Serial.println("Entered settings mode");
   // Prevent immediate selection
   joystickButtonPrevious = true;
   delay(300);
@@ -1100,22 +971,26 @@ void handleSettingsMenu(unsigned long currentTime) {
   
   // Button press for selection
   if (joystickButtonPressed && !joystickButtonPrevious) {
-    Serial.print("Selected menu item: ");
-    Serial.println(currentMenuIndex);
     
-    if (currentMenuIndex == NUM_MENU_ITEMS - 1) {  // Exit & Save (index 11)
+    if (currentMenuIndex == 15) {  // Exit & Save - updated index
       lcd.clear();
       lcd.print("Saving settings");
       lcd.setCursor(0, 1);
       lcd.print("and restarting...");
       delay(1000);
-      saveSettings(); // This will now restart automatically
+      saveSettings();
     } 
-    else if (currentMenuIndex == NUM_MENU_ITEMS - 2) {  // Reset Device (index 10)
+    else if (currentMenuIndex == 17) {  // Reset Device - updated index
       resetDevice();
     }
-    else if (currentMenuIndex == NUM_MENU_ITEMS - 3) {  // Restore Default (index 9)
+    else if (currentMenuIndex == 16) {  // Restore Default - updated index
       restoreDefaultSettings();
+    }
+    else if (currentMenuIndex == 13) {  // Servo 1 test
+      testServo1();
+    }
+    else if (currentMenuIndex == 14) {  // Servo 3 test
+      testServo3();
     }
     else {
       // Adjust setting value
@@ -1135,53 +1010,63 @@ void adjustSettingValue(int settingIndex, unsigned long currentTime) {
   
   // Get current value based on selected setting
   switch (settingIndex) {
-    case 0:  // Flowrate
-      tempValue = settings.flowRate;
-      break;
-    case 1:  // Run calibration - special case
+    case 0:  // Run calibration - scale calibration (auto/manual)
       if (settings.useManualCalibration) {
-        runWaterCalibration();
+        // Manual scale calibration - adjust calibration point
+        displayCalibrationPoint();
       } else {
+        // Auto scale calibration
         runAutoCalibration();
       }
       return;
-    case 2:  // Water amount
-      tempValue = settings.waterAmount;
-      break;
-    case 3:  // Cal mode
-      tempValue = settings.useManualCalibration ? 1 : 0;
-      break;
-    case 4:  // Cal point - mode dependent
+    case 1:  // Cal mode
+      toggleCalibrationMode();
+      return;
+    case 2:  // Cal point - mode dependent
       displayCalibrationPoint();
       return;
-    case 5:  // Min weight
-      tempValue = settings.minValidWeight * 10;
+    case 3:  // Run water cal - water flow rate calibration
+      runWaterCalibration();
+      return;
+    case 4:  // Flowrate
+      tempValue = settings.flowRate;
       break;
-    case 6:  // Max weight
-      tempValue = settings.maxValidWeight * 10;
+    case 5:  // Water amount
+      tempValue = settings.waterAmount;
       break;
-    case 7:  // Plastic full
-      tempValue = settings.plasticFullAmount * 10;
+    case 6:  // Dispense water - special case
+      runManualWaterDispense();
+      return;
+    case 7:  // Min plastic weight
+      tempValue = settings.minPlasticWeight * 10;
       break;
-    case 8:  // Metal full
-      tempValue = settings.metalFullAmount * 10;
+    case 8:  // Max plastic weight
+      tempValue = settings.maxPlasticWeight * 10;
       break;
+    case 9:  // Min metal weight
+      tempValue = settings.minMetalWeight * 10;
+      break;
+    case 10:  // Max metal weight
+      tempValue = settings.maxMetalWeight * 10;
+      break;
+    case 11:  // Plastic full - show live bin level and adjust threshold
+      displayBinLevel(true); // true for plastic
+      return;
+    case 12:  // Metal full - show live bin level and adjust threshold
+      displayBinLevel(false); // false for metal
+      return;
   }
-  
-  // Handle calibration mode toggle
-  if (settingIndex == 3) {
-    toggleCalibrationMode();
-    return;
-  }
-  
   // Regular value adjustment for other settings
   lcd.clear();
   lcd.print(menuItems[settingIndex]);
   lcd.setCursor(0, 1);
   lcd.print("Value: ");
   
-  if (settingIndex == 0 || settingIndex == 2) {
-    lcd.print(tempValue);  // Integer values for flowrate and water amount
+  if (settingIndex == 4) {
+    lcd.print(tempValue);  // Integer values for flowrate
+  } else if (settingIndex == 5) {
+    lcd.print(tempValue);
+    lcd.print("ml");  // Show ml unit for water amount
   } else {
     lcd.print(tempValue / 10.0, 1);  // Decimal values
   }
@@ -1196,26 +1081,40 @@ void adjustSettingValue(int settingIndex, unsigned long currentTime) {
     
     if (currentTime - lastJoystickMove >= JOYSTICK_DEBOUNCE) {
       if (joystickXValue < 300) {  // Left - decrease
-        tempValue--;
+        if (settingIndex == 5 && tempValue > 1) {  // Water amount - 1ml increments, minimum 1ml
+          tempValue--;
+        } else if (settingIndex != 5) {
+          tempValue--;
+        }
         lastJoystickMove = currentTime;
         lcd.setCursor(0, 1);
         lcd.print("Value: ");
-        if (settingIndex == 0 || settingIndex == 2) {
+        if (settingIndex == 4) {
           lcd.print(tempValue);
           lcd.print("    ");
+        } else if (settingIndex == 5) {
+          lcd.print(tempValue);
+          lcd.print("ml    ");
         } else {
           lcd.print(tempValue / 10.0, 1);
           lcd.print("    ");
         }
       }
       else if (joystickXValue > 700) {  // Right - increase
-        tempValue++;
+        if (settingIndex == 5 && tempValue < 2000) {  // Water amount - 1ml increments, maximum 2000ml
+          tempValue++;
+        } else if (settingIndex != 5) {
+          tempValue++;
+        }
         lastJoystickMove = currentTime;
         lcd.setCursor(0, 1);
         lcd.print("Value: ");
-        if (settingIndex == 0 || settingIndex == 2) {
+        if (settingIndex == 4) {
           lcd.print(tempValue);
           lcd.print("    ");
+        } else if (settingIndex == 5) {
+          lcd.print(tempValue);
+          lcd.print("ml    ");
         } else {
           lcd.print(tempValue / 10.0, 1);
           lcd.print("    ");
@@ -1227,31 +1126,32 @@ void adjustSettingValue(int settingIndex, unsigned long currentTime) {
     if (joystickButtonPressed && !joystickButtonPrevious) {
       // Save the adjusted value
       switch (settingIndex) {
-        case 0:  // Flowrate
+        case 4:  // Flowrate
           settings.flowRate = tempValue;
           WATER_FLOW_RATE = settings.flowRate;
           break;
-        case 2:  // Water amount
+        case 5:  // Water amount
           settings.waterAmount = tempValue;
           WATER_AMOUNT = settings.waterAmount;
           WATER_DISPENSE_DURATION = (WATER_AMOUNT / WATER_FLOW_RATE) * 60 * 1000;
           break;
-        case 5:  // Min weight
-          settings.minValidWeight = tempValue / 10.0;
-          MIN_VALID_WEIGHT = settings.minValidWeight;
+        case 7:  // Min plastic weight
+          settings.minPlasticWeight = tempValue / 10.0;
+          MIN_PLASTIC_WEIGHT = settings.minPlasticWeight;
           break;
-        case 6:  // Max weight
-          settings.maxValidWeight = tempValue / 10.0;
-          MAX_VALID_WEIGHT = settings.maxValidWeight;
+        case 8:  // Max plastic weight
+          settings.maxPlasticWeight = tempValue / 10.0;
+          MAX_PLASTIC_WEIGHT = settings.maxPlasticWeight;
           break;
-        case 7:  // Plastic full
-          settings.plasticFullAmount = tempValue / 10.0;
-          PLASTIC_FULL_AMOUNT = settings.plasticFullAmount;
+        case 9:  // Min metal weight
+          settings.minMetalWeight = tempValue / 10.0;
+          MIN_METAL_WEIGHT = settings.minMetalWeight;
           break;
-        case 8:  // Metal full
-          settings.metalFullAmount = tempValue / 10.0;
-          METAL_FULL_AMOUNT = settings.metalFullAmount;
+        case 10:  // Max metal weight
+          settings.maxMetalWeight = tempValue / 10.0;
+          MAX_METAL_WEIGHT = settings.maxMetalWeight;
           break;
+
       }
       
       adjusting = false;
@@ -1281,8 +1181,10 @@ void loadSettings() {
     settings.useManualCalibration = USE_MANUAL_CALIBRATION;
     settings.manualCalibrationFactor = MANUAL_CALIBRATION_FACTOR;
     settings.autoCalibrationFactor = 0;
-    settings.minValidWeight = MIN_VALID_WEIGHT;
-    settings.maxValidWeight = MAX_VALID_WEIGHT;
+    settings.minPlasticWeight = MIN_PLASTIC_WEIGHT;
+    settings.maxPlasticWeight = MAX_PLASTIC_WEIGHT;
+    settings.minMetalWeight = MIN_METAL_WEIGHT;
+    settings.maxMetalWeight = MAX_METAL_WEIGHT;
     settings.plasticFullAmount = PLASTIC_FULL_AMOUNT;
     settings.metalFullAmount = METAL_FULL_AMOUNT;
     
@@ -1294,13 +1196,13 @@ void loadSettings() {
     WATER_DISPENSE_DURATION = (WATER_AMOUNT / WATER_FLOW_RATE) * 60 * 1000;
     USE_MANUAL_CALIBRATION = settings.useManualCalibration;
     MANUAL_CALIBRATION_FACTOR = settings.manualCalibrationFactor;
-    MIN_VALID_WEIGHT = settings.minValidWeight;
-    MAX_VALID_WEIGHT = settings.maxValidWeight;
+    MIN_PLASTIC_WEIGHT = settings.minPlasticWeight;
+    MAX_PLASTIC_WEIGHT = settings.maxPlasticWeight;
+    MIN_METAL_WEIGHT = settings.minMetalWeight;
+    MAX_METAL_WEIGHT = settings.maxMetalWeight;
     PLASTIC_FULL_AMOUNT = settings.plasticFullAmount;
     METAL_FULL_AMOUNT = settings.metalFullAmount;
   }
-  
-  Serial.println("Settings loaded from EEPROM");
 }
 
 // Save settings to EEPROM and restart device
@@ -1311,8 +1213,10 @@ void saveSettings() {
   settings.useManualCalibration = USE_MANUAL_CALIBRATION;
   settings.manualCalibrationFactor = MANUAL_CALIBRATION_FACTOR;
   settings.autoCalibrationFactor = calibration_factor;
-  settings.minValidWeight = MIN_VALID_WEIGHT;
-  settings.maxValidWeight = MAX_VALID_WEIGHT;
+  settings.minPlasticWeight = MIN_PLASTIC_WEIGHT;
+  settings.maxPlasticWeight = MAX_PLASTIC_WEIGHT;
+  settings.minMetalWeight = MIN_METAL_WEIGHT;
+  settings.maxMetalWeight = MAX_METAL_WEIGHT;
   settings.plasticFullAmount = PLASTIC_FULL_AMOUNT;
   settings.metalFullAmount = METAL_FULL_AMOUNT;
   
@@ -1323,9 +1227,6 @@ void saveSettings() {
   lcd.print("Settings saved!");
   lcd.setCursor(0, 1);
   lcd.print("Restarting...");
-  
-  Serial.println("Settings saved to EEPROM");
-  Serial.println("Restarting device to apply changes...");
   
   delay(2000);
   
@@ -1375,8 +1276,10 @@ void restoreDefaultSettings() {
       WATER_AMOUNT = 250.0;
       USE_MANUAL_CALIBRATION = true;
       MANUAL_CALIBRATION_FACTOR = -243.0;
-      MIN_VALID_WEIGHT = 13.0;
-      MAX_VALID_WEIGHT = 35.0;
+      MIN_PLASTIC_WEIGHT = 13.0;
+      MAX_PLASTIC_WEIGHT = 25.0;
+      MIN_METAL_WEIGHT = 20.0;
+      MAX_METAL_WEIGHT = 35.0;
       PLASTIC_FULL_AMOUNT = 10.0;
       METAL_FULL_AMOUNT = 10.0;
       
@@ -1392,8 +1295,10 @@ void restoreDefaultSettings() {
       settings.useManualCalibration = USE_MANUAL_CALIBRATION;
       settings.manualCalibrationFactor = MANUAL_CALIBRATION_FACTOR;
       settings.autoCalibrationFactor = 0;
-      settings.minValidWeight = MIN_VALID_WEIGHT;
-      settings.maxValidWeight = MAX_VALID_WEIGHT;
+      settings.minPlasticWeight = MIN_PLASTIC_WEIGHT;
+      settings.maxPlasticWeight = MAX_PLASTIC_WEIGHT;
+      settings.minMetalWeight = MIN_METAL_WEIGHT;
+      settings.maxMetalWeight = MAX_METAL_WEIGHT;
       settings.plasticFullAmount = PLASTIC_FULL_AMOUNT;
       settings.metalFullAmount = METAL_FULL_AMOUNT;
       EEPROM.put(EEPROM_SETTINGS_ADDR, settings);
@@ -1446,12 +1351,10 @@ void runWaterCalibration() {
   
   lcd.clear();
   lcd.print("Running for 30s");
-  lcd.setCursor(0, 1);
-  lcd.print("Measure water!");
   
-  // Run pump for 30 seconds
+  // Run pump for exactly 30 seconds
   digitalWrite(RELAY_PUMP, LOW);  // Turn ON pump
-  delay(30000);  // 30 seconds
+  delay(30000);  // Wait 30 seconds
   digitalWrite(RELAY_PUMP, HIGH); // Turn OFF pump
   
   lcd.clear();
@@ -1488,8 +1391,8 @@ void runWaterCalibration() {
     }
     
     if (joystickButtonPressed && !joystickButtonPrevious) {
-      // Calculate flow rate (ml per minute)
-      settings.flowRate = measuredAmount * 2;  // 30 seconds * 2 = 1 minute
+      // Calculate flow rate (ml per minute) from 30-second measurement
+      settings.flowRate = (measuredAmount * 60.0) / 30.0;  // Convert 30-second amount to ml/min
       WATER_FLOW_RATE = settings.flowRate;
       
       // Update water dispense duration
@@ -1683,4 +1586,287 @@ void displayCalibrationPoint() {
       delay(10);
     }
   }
+}
+
+// Test servo 1 (main gate)
+void testServo1() {
+  lcd.clear();
+  lcd.print("Servo 1 Test");
+  lcd.setCursor(0, 1);
+  lcd.print("Move to control");
+  
+  joystickButtonPrevious = true;
+  delay(500);
+  
+  while (true) {
+    readJoystick();
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastJoystickMove >= JOYSTICK_DEBOUNCE) {
+      if (joystickXValue < 300) {  // Left - close
+        servo1.write(SERVO1_CLOSED);
+        lcd.setCursor(0, 1);
+        lcd.print("CLOSED          ");
+        lastJoystickMove = currentTime;
+      }
+      else if (joystickXValue > 700) {  // Right - open
+        servo1.write(SERVO1_OPEN);
+        lcd.setCursor(0, 1);
+        lcd.print("OPEN            ");
+        lastJoystickMove = currentTime;
+      }
+    }
+    
+    if (joystickButtonPressed && !joystickButtonPrevious) {
+      servo1.write(SERVO1_CLOSED);
+      updateSettingsDisplay();
+      return;
+    }
+    joystickButtonPrevious = joystickButtonPressed;
+    delay(10);
+  }
+}
+
+// Test servo 3 (water dispenser guide)
+void testServo3() {
+  lcd.clear();
+  lcd.print("Servo 3 Test");
+  lcd.setCursor(0, 1);
+  lcd.print("Move to control");
+  
+  int currentPosition = SERVO3_NEUTRAL;
+  servo3.write(currentPosition);
+  
+  joystickButtonPrevious = true;
+  delay(500);
+  
+  while (true) {
+    readJoystick();
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastJoystickMove >= JOYSTICK_DEBOUNCE) {
+      if (joystickXValue < 300) {  // Left - plastic position
+        currentPosition = SERVO3_PLASTIC;
+        servo3.write(currentPosition);
+        lcd.setCursor(0, 1);
+        lcd.print("PLASTIC         ");
+        lastJoystickMove = currentTime;
+      }
+      else if (joystickXValue > 700) {  // Right - metal position
+        currentPosition = SERVO3_METAL;
+        servo3.write(currentPosition);
+        lcd.setCursor(0, 1);
+        lcd.print("METAL           ");
+        lastJoystickMove = currentTime;
+      }
+    }
+    
+    if (joystickButtonPressed && !joystickButtonPrevious) {
+      servo3.write(SERVO3_NEUTRAL);
+      updateSettingsDisplay();
+      return;
+    }
+    joystickButtonPrevious = joystickButtonPressed;
+    delay(10);
+  }
+}
+
+// Handle water button with debounce
+void handleWaterButton(unsigned long currentTime) {
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = digitalRead(WATER_BUTTON);
+  
+  // Detect button press
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    if (currentTime - lastButtonPress > BUTTON_DEBOUNCE_TIME) {
+      if (waterDispensing) {
+        // Stop dispensing if already running
+        stopWaterDispense();
+      } else {
+        // Check credits
+        if (credits >= WATER_CREDIT_COST) {
+          credits -= WATER_CREDIT_COST;
+          startWaterDispense(currentTime);
+        } else {
+          buzzWarning();
+          // Flash error LED
+          digitalWrite(LED_ERROR, HIGH);
+          delay(500);
+          digitalWrite(LED_ERROR, LOW);
+        }
+      }
+      lastButtonPress = currentTime;
+    }
+  }
+  
+  lastButtonState = currentButtonState;
+}
+
+// Open main gate
+void openGate1(unsigned long currentTime) {
+  servo1.write(SERVO1_OPEN);
+  gate1Open = true;
+  gate1OpenTime = currentTime;
+}
+
+// Display bin level and allow threshold adjustment
+void displayBinLevel(bool isPlastic) {
+  lcd.clear();
+  lcd.print(isPlastic ? "Plastic Bin" : "Metal Bin");
+  
+  int tempValue = isPlastic ? (settings.plasticFullAmount * 10) : (settings.metalFullAmount * 10);
+  joystickButtonPrevious = true;
+  delay(300);
+  
+  while (true) {
+    readJoystick();
+    unsigned long currentTime = millis();
+    
+    // Update display every 500ms to show live levels
+    static unsigned long lastLevelUpdate = 0;
+    if (currentTime - lastLevelUpdate >= 500) {
+      float actualLevel = isPlastic ? plasticBinDistance : metalBinDistance;
+      
+      lcd.setCursor(0, 0);
+      lcd.print(isPlastic ? "Plastic:" : "Metal:  ");
+      lcd.print(actualLevel, 1);  // Show actual distance
+      lcd.print("cm");
+      
+      lcd.setCursor(0, 1);
+      lcd.print("Limit: ");
+      lcd.print(tempValue / 10.0, 1);  // Show threshold limit
+      lcd.print("cm    ");
+      
+      lastLevelUpdate = currentTime;
+    }
+    
+    if (currentTime - lastJoystickMove >= JOYSTICK_DEBOUNCE) {
+      if (joystickXValue < 300) {  // Left - decrease threshold
+        if (tempValue > 10) tempValue--;  // Minimum 1.0cm
+        lastJoystickMove = currentTime;
+      }
+      else if (joystickXValue > 700) {  // Right - increase threshold
+        if (tempValue < 500) tempValue++;  // Maximum 50.0cm
+        lastJoystickMove = currentTime;
+      }
+    }
+    
+    if (joystickButtonPressed && !joystickButtonPrevious) {
+      // Save the adjusted threshold value
+      if (isPlastic) {
+        settings.plasticFullAmount = tempValue / 10.0;
+        PLASTIC_FULL_AMOUNT = settings.plasticFullAmount;
+      } else {
+        settings.metalFullAmount = tempValue / 10.0;
+        METAL_FULL_AMOUNT = settings.metalFullAmount;
+      }
+      
+      lcd.clear();
+      lcd.print("Threshold set:");
+      lcd.setCursor(0, 1);
+      lcd.print(tempValue / 10.0, 1);
+      lcd.print("cm");
+      delay(1500);
+      
+      updateSettingsDisplay();
+      return;
+    }
+    joystickButtonPrevious = joystickButtonPressed;
+    delay(10);
+  }
+}
+
+// Manual water dispense function with input amount and interruption
+void runManualWaterDispense() {
+  lcd.clear();
+  lcd.print("Dispense water");
+  lcd.setCursor(0, 1);
+  lcd.print("Amount: 0ml");
+  
+  // Input amount
+  int dispenseAmount = 0;
+  joystickButtonPrevious = true;
+  delay(300);
+  
+  while (true) {
+    readJoystick();
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastJoystickMove >= JOYSTICK_DEBOUNCE) {
+      if (joystickXValue < 300) {  // Left - decrease amount
+        if (dispenseAmount > 0) dispenseAmount -= 1;  // 1ml increments
+        lastJoystickMove = currentTime;
+        lcd.setCursor(0, 1);
+        lcd.print("Amount: ");
+        lcd.print(dispenseAmount);
+        lcd.print("ml    ");
+      }
+      else if (joystickXValue > 700) {  // Right - increase amount
+        if (dispenseAmount < 2000) dispenseAmount += 1;  // 1ml increments, max 2000ml
+        lastJoystickMove = currentTime;
+        lcd.setCursor(0, 1);
+        lcd.print("Amount: ");
+        lcd.print(dispenseAmount);
+        lcd.print("ml    ");
+      }
+    }
+    
+    if (joystickButtonPressed && !joystickButtonPrevious) {
+      break;
+    }
+    joystickButtonPrevious = joystickButtonPressed;
+    delay(10);
+  }
+  
+  // Calculate dispense duration
+  unsigned long dispenseDuration = (dispenseAmount / WATER_FLOW_RATE) * 60 * 1000;
+  
+  lcd.clear();
+  lcd.print("Dispensing...");
+  lcd.setCursor(0, 1);
+  lcd.print(dispenseAmount);
+  lcd.print("ml");
+  
+  // Start pump
+  digitalWrite(RELAY_PUMP, LOW);  // Turn ON pump
+  buzzShort();
+  
+  unsigned long dispenseStartTime = millis();
+  bool interrupted = false;
+  
+  // Dispense with interruption check
+  while (millis() - dispenseStartTime < dispenseDuration) {
+    // Check water button
+    if (digitalRead(WATER_BUTTON) == LOW) {
+      interrupted = true;
+      break;
+    }
+    
+    // Check joystick button
+    readJoystick();
+    if (joystickButtonPressed) {
+      interrupted = true;
+      break;
+    }
+    
+    delay(10);
+  }
+  
+  // Stop pump
+  digitalWrite(RELAY_PUMP, HIGH); // Turn OFF pump
+  buzzShort();
+  
+  lcd.clear();
+  if (interrupted) {
+    lcd.print("Dispense stopped");
+    lcd.setCursor(0, 1);
+    lcd.print("by user");
+  } else {
+    lcd.print("Dispense");
+    lcd.setCursor(0, 1);
+    lcd.print("Complete!");
+  }
+  delay(2000);
+  
+  updateSettingsDisplay();
 }
